@@ -753,21 +753,10 @@ fi
 )
 ```
 
-#### 3. 查询封禁状态（只改 PORT，只输出中文结果）
+#### 3. 查询所有临时封禁端口（自动查询，无需填写 PORT）
 
 ```bash
-(
-PORT=40022
-[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || { echo "❌ 端口无效"; exit 1; }
-T="pause_vless_$PORT"
-R=$(nft list chain inet "$T" input 2>/dev/null) || R=""
-if grep -Fq "iifname != \"lo\" tcp dport $PORT reject with tcp reset" <<<"$R" &&
-   grep -Fq "iifname != \"lo\" udp dport $PORT drop" <<<"$R"; then
-  echo "✅ $PORT 已封禁（IPv4 + IPv6 + TCP + UDP）"
-else
-  echo "❌ $PORT 未完整封禁（或没有临时封禁规则）"
-fi
-)
+printf '\n========== 临时封禁端口查询 ==========\n'; nft list tables | awk '$1=="table"&&$2=="inet"&&$3~/^pause_vless_[0-9]+$/{print $3}' | sort -V | while read -r t; do p=\${t#pause_vless_}; r=$(nft list chain inet "$t" input 2>/dev/null); tcp="NO"; udp="NO"; grep -Fq "iifname != \"lo\" tcp dport $p reject with tcp reset" <<<"$r" && tcp="YES"; grep -Fq "iifname != \"lo\" udp dport $p drop" <<<"$r" && udp="YES"; [[ "$tcp" == YES && "$udp" == YES ]] && status="✅ 完整封禁" || status="⚠️ 规则不完整"; printf '\n端口: %s\nTCP : %s\nUDP : %s\n状态: %s\n' "$p" "$tcp" "$udp" "$status"; done; printf '\n======================================\n\n'
 ```
 
 **无残留说明：** 解除封禁会删除这个端口专属的 nftables 表以及其中全部链和规则，不产生本功能的配置文件、定时任务或后台进程。命令本身仍可能留在 Bash history；已有 TCP 连接在内核中的状态、系统日志不会因此自动清除。
