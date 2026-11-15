@@ -1,9 +1,31 @@
-name: SOCKS5 access audit regression
+name: SOCKS5 audit and UDP regression
 on:
   push:
     branches:
       - main
       - feature/socks5-access-audit
+      - feature/socks5-udp
+    paths:
+      - .github/workflows/socks5-access-audit.yml
+      - .gitattributes
+      - README.md
+      - socks5.py
+      - socks5-traffic.py
+      - socks5-audit.py
+      - socks5-install.sh
+      - tests/test_socks5_*.py
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/socks5-access-audit.yml
+      - .gitattributes
+      - README.md
+      - socks5.py
+      - socks5-traffic.py
+      - socks5-audit.py
+      - socks5-install.sh
+      - tests/test_socks5_*.py
   workflow_dispatch:
 jobs:
   offline-audit-tests:
@@ -18,6 +40,10 @@ jobs:
           python3 -m py_compile socks5.py socks5-traffic.py socks5-audit.py
           bash -n socks5-install.sh
           python3 -m unittest discover -s tests -p test_socks5_access_audit.py -v
+      - name: Check UDP ownership, guards and daily traffic
+        run: |
+          python3 -m unittest discover -s tests -p test_socks5_udp_core.py -v
+          python3 -m unittest discover -s tests -p test_socks5_udp_traffic.py -v
       - name: Offline CI does not replace host acceptance
         run: |
           echo 'Offline CI succeeded or failed independently of required real-host tests.'

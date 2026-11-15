@@ -5,6 +5,12 @@ umask 077
 [[ ${EUID:-999} -eq 0 ]] || { echo '请使用 root' >&2; exit 1; }
 DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACTION="${1:-install}"
+S5_3PROXY_CHANNEL="${S5_3PROXY_CHANNEL:-lts}"
+case "$S5_3PROXY_CHANNEL" in
+  lts) S5_3PROXY_SUITE=lts ;;
+  stable) S5_3PROXY_SUITE=current ;;
+  *) echo 'S5_3PROXY_CHANNEL 只能为 lts 或 stable' >&2;exit 2;;
+esac
 case "$ACTION" in
   install|update) shift || true ;;
   deps) ;;
@@ -37,8 +43,8 @@ if [[ "$ACTION" != deps ]];then
     SRC_DIR="$FETCH_DIR"
     echo "[socks5] 从 jieshu/$S5_SOURCE_REF 下载三个 SOCKS5 模块..."
   fi
-  expected_core="4c6d97e82749973d17274d96dc3f3cf828ca357638fcc6019c487ba3f49a3dcf"
-  expected_traffic="134bcd2a2ee8947bcad3bad09c6f0d50ea5474249701758c514a2294274deb23"
+  expected_core="712bb120e4d8fbc61d163c4655172698b45a028b20b01062eb3cc02a2f93aecd"
+  expected_traffic="1361a91419dbe9236960f7f5cfa6f75a439c45d3af2ae1de2192192c81fcde7e"
   expected_audit="3c6e1bb357959e12d04c9adf2ba0a99f51ca349c4b812f8b6981259843acf7c8"
   actual_audit="$(sha256sum "$SRC_DIR/socks5-audit.py" | awk '{print $1}')"
   actual_core="$(sha256sum "$SRC_DIR/socks5.py" | awk '{print $1}')"
@@ -52,19 +58,21 @@ install_dependencies(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -o Acquire::Retries=3
   apt-get install -y ca-certificates curl gnupg python3 nftables iproute2 util-linux coreutils procps
-  if command -v 3proxy >/dev/null 2>&1;then return;fi
-  if apt-cache show 3proxy >/dev/null 2>&1;then apt-get install -y 3proxy;fi
-  if command -v 3proxy >/dev/null 2>&1;then return;fi
+  if [[ "$S5_3PROXY_CHANNEL" == lts ]];then
+    if command -v 3proxy >/dev/null 2>&1;then return;fi
+    if apt-cache show 3proxy >/dev/null 2>&1;then apt-get install -y 3proxy;fi
+    if command -v 3proxy >/dev/null 2>&1;then return;fi
+  fi
   keytmp="$(mktemp)"
   trap 'rm -f -- "$keytmp"' RETURN
   curl -fLsS --connect-timeout 10 --max-time 60 'https://3proxy.org/repo/3proxy-release-key.asc' -o "$keytmp"
   fingerprint="$(gpg --batch --quiet --show-keys --with-colons "$keytmp" | awk -F: '$1=="fpr" {print toupper($10);exit}')"
   [[ "$fingerprint" == 'FC12214499FCC7BA1CFF6CDC0312384E3A73940B' ]] || { echo "不可信的 3proxy signing key: $fingerprint" >&2;exit 1; }
   install -m 0644 "$keytmp" /usr/share/keyrings/socks5-3proxy.asc
-  cat >/etc/apt/sources.list.d/socks5-3proxy.sources <<'EOF'
+  cat >/etc/apt/sources.list.d/socks5-3proxy.sources <<EOF
 Types: deb
 URIs: https://3proxy.org/repo/deb
-Suites: lts
+Suites: $S5_3PROXY_SUITE
 Components: main
 Signed-By: /usr/share/keyrings/socks5-3proxy.asc
 EOF
@@ -74,9 +82,13 @@ EOF
 }
 if [[ "$ACTION" == deps ]];then install_dependencies;exit 0;fi
 if [[ "${AUTO_DEPS:-0}" == 1 ]];then
-  for name in 3proxy python3 nft ip ss timeout flock;do
-    if ! command -v "$name" >/dev/null 2>&1;then install_dependencies;break;fi
-  done
+  if [[ "$S5_3PROXY_CHANNEL" == stable ]];then
+    install_dependencies
+  else
+    for name in 3proxy python3 nft ip ss timeout flock;do
+      if ! command -v "$name" >/dev/null 2>&1;then install_dependencies;break;fi
+    done
+  fi
 fi
 for name in 3proxy python3 nft ip ss timeout systemctl flock;do
   command -v "$name" >/dev/null || { echo "缺少 $name；运行 AUTO_DEPS=1 bash socks5-install.sh install ..." >&2;exit 1; }

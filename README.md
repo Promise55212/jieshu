@@ -388,6 +388,24 @@ HOURS=1; IP_LIMIT=1 IP_STICKY_SECONDS=60 PORT=41004 D=$((HOURS*3600)) socks5 add
 
 **重要：下面管理命令使用的是本机监听端口 `41004`，不是路由器映射的外部端口 `51004`。**
 
+#### 可选：为新账号启用 UDP
+
+默认仍只允许 TCP CONNECT。需要 UDP 的新账号显式指定独占的本机 UDP 中继范围，例如：
+
+```bash
+HOURS=1; IP_LIMIT=1 IP_STICKY_SECONDS=60 PQ_GIB=1 PORT=41004 D=$((HOURS*3600)) socks5 add --udp-range 55000-55063
+```
+
+需要支持 `intport` 的 3proxy 版本、cgroup v2、systemd 和 nft socket 表达式；本次实验使用 3proxy 1.0.3。范围最多 256 个端口，必须位于本机 `ip_local_port_range` 内，并与其他 SOCKS5 UDP 账号和已占用 UDP 端口分开。示例范围不是所有机器都可用，创建时会检查。
+
+TCP 和 UDP 共用同一份总配额、同一组活跃来源 IP 名额，以及每日上传/下载计数。UDP 关联依赖 TCP 控制连接，客户端必须支持 UDP ASSOCIATE。范围耗尽后不能通过随机端口绕过计量；应减少关联数或为新账号选用更大的范围。
+
+公网服务器需要放行 TCP 监听端口和整段 UDP 中继端口。路由器后面的主机还需要将 UDP 范围**按相同端口逐一映射**到本机，并用 `--host` 指定公网入口；`--public-port` 只改变 TCP 入口，不会替 UDP 范围改写端口。UDP 不提供 IPv6 目标或内网目标访问。
+
+UDP 的公网中继地址在实例启动时解析。家宽公网 IP 改变后，DDNS 更新不会自动刷新已运行实例的 UDP 回复地址；需要从 `socks5 show 本机端口` 核对账号 `id`，再重启对应的 `socks5-@账号ID.service`。这会断开该账号已有连接。本次固定公网 IP 实验未覆盖动态公网地址切换。
+
+现有账号不会因升级自动开放 UDP。访问审计中的 UDP 记录按关联产生，不能当作逐包或每个目标的完整访问记录。`portbw` 按实际本机端口工作，只对 `41004` 设置限速不会覆盖上述 UDP 中继范围；本功能的共享配额不等于 TCP/UDP 合计限速。
+
 </details>
 
 <a id="modify"></a>
@@ -593,7 +611,7 @@ socks5 watch
 
 SOCKS5 与 VLESS 使用**同一套独立 `portbw` 限速方法**，无需重复设置命令。请在**实际运行 SOCKS5 的家宽主机**先按[安装 portbw](#portbw-install)完成安装，再按[端口限速](#portbw)设置；把自动限速示例里的 `40000` 改成 SOCKS5 的**本机监听端口**（如 `41004`），即可使用相同的静态限速或 **40→18 Mbps、100% 持续 45 秒、滚动保护 120 秒、零冷却**的自动限速。查询所有端口时，同样使用前文的 `portbw report`。
 
-**注意：** 如果路由器把公网端口 `51004` 映射到家宽主机的 `41004`，限速应设置在本机端口 **`41004`**，不是公网端口 `51004`。SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按本机端口管理 TCP+UDP。SOCKS5 账号创建、到期、删除均不会自动增删 `portbw` 规则；升级 `portbw` 也不会修改 SOCKS5 账号、配额和服务。已安装非本系列管理的旧版 `portbw` 的主机先参考[旧版 portbw 迁移说明](#portbw-install)安全迁移；已有受管理版本按 `preflight-upgrade` / `upgrade` 操作。
+**注意：** 如果路由器把公网端口 `51004` 映射到家宽主机的 `41004`，TCP 限速应设置在本机端口 **`41004`**，不是公网端口 `51004`。SOCKS5 默认仅 TCP；显式启用 UDP 的账号使用另外的中继范围，仅设置 TCP 监听端口不会限制该范围。`portbw` 独立按本机端口管理 TCP+UDP，不提供 SOCKS5 账号所有中继端口共用一份速度的功能。SOCKS5 账号创建、到期、删除均不会自动增删 `portbw` 规则；升级 `portbw` 也不会修改 SOCKS5 账号、配额和服务。已安装非本系列管理的旧版 `portbw` 的主机先参考[旧版 portbw 迁移说明](#portbw-install)安全迁移；已有受管理版本按 `preflight-upgrade` / `upgrade` 操作。
 
 </details>
 
@@ -1289,6 +1307,18 @@ AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/
 ```
 
 主机位于路由器 NAT 后面时，可以在 `install` 后加 `--host proxy.example.com`（换成自己的公网域名/IP）。必要时加 `--wan-if eth0` 指定物理出口网卡。
+
+需要创建 UDP 账号时，安装器可显式选择官方签名仓库的 stable 通道；默认依然为 lts。对本地配套源码执行：
+
+```bash
+S5_3PROXY_CHANNEL=stable AUTO_DEPS=1 bash socks5-install.sh install
+```
+
+同时指定 `S5_3PROXY_CHANNEL=stable AUTO_DEPS=1` 会安装或更新主机上的 3proxy 软件包；安装器将 stable 选项映射到官方 apt 的 `current` 通道。账号是否开放 UDP 仍由创建时的 `--udp-range` 决定。已有账号使用同一份本地配套源码更新：
+
+```bash
+S5_3PROXY_CHANNEL=stable AUTO_DEPS=1 bash socks5-install.sh update
+```
 
 **更新现有 SOCKS5 管理器（建议先做 VPS 快照；升级期间已有 3proxy 实例可能短暂重启）：**
 
@@ -2041,7 +2071,7 @@ SOCKS5 日志迁移后的回退不应依靠重新运行旧安装器覆盖；需�
 | 按端口管理 VLESS / SOCKS5 配额与来源 IP | 同一节点被多人共用时，按该节点合并计量；不能区分链接背后的真实人数 |
 | 端口自动限速 | 需独立安装并给端口设置策略，不会因创建节点自动套用本文标准 |
 | 审计与手工封禁 | 审计给线索，封禁要另行执行；没有在这份手册中实现自动判定滥用并自动处罚 |
-| SOCKS5 代理 | TCP CONNECT；不支持 UDP ASSOCIATE，应用需支持带认证的 SOCKS5 |
+| SOCKS5 代理 | 默认 TCP CONNECT；新账号可用 `--udp-range` 显式启用 IPv4 UDP ASSOCIATE，应用需支持带认证的 SOCKS5 和对应 UDP 功能 |
 | 日志历史与每日流量 | 从实际开始记录且仍保留的数据查询，不能恢复未记录或已清理历史 |
 | 节点管理与升级 | 不提供在本文中未列明的续费、后台面板、自动备份或通用卸载 / 降级功能；不要猜子命令 |
 

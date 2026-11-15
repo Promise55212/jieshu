@@ -12,7 +12,9 @@ from pathlib import Path
 import re
 import sys
 import uuid
-from socks5 import STATE, UNITDIR, atomic_json, atomic_write, load, nodes, locked, cmd, Fail, render_table
+from socks5 import (STATE, UNITDIR, atomic_json, atomic_write, load, nodes,
+                    locked, cmd, Fail, render_table, udp_range,
+                    udp_client_match, udp_client_expr, _udp_expr_equal)
 
 TABLE='s5m_daily'
 TZ=dt.timezone(dt.timedelta(hours=8),'Asia/Shanghai')
@@ -26,6 +28,8 @@ def active_nodes(now):
         identity=f"{n['instance']}|{n['port']}|{n['username']}|{n['created']}"
         key=hashlib.sha256(identity.encode()).hexdigest()[:32]
         result[n['id']]={'id':n['id'],'port':n['port'],'key':key}
+        if udp_range(n):
+            result[n['id']].update(udp_range=n['udp_range'],instance=n['instance'])
     return result
 
 
@@ -51,10 +55,15 @@ def counters(snapshot):
     return result
 
 
-def matching(rule,chain,port,name):
+def matching(rule,chain,port,name,udp_node=None):
     field='dport' if chain=='input' else 'sport'
     expected=[{'match':{'op':'==','left':{'payload':{'protocol':'tcp','field':field}},'right':port}},{'counter':name}]
-    return rule.get('chain')==chain and rule.get('comment')==name and rule.get('expr')==expected
+    if udp_node is not None:
+        expected=udp_client_expr(udp_node,chain)+[{'counter':name}]
+        expressions_ok=_udp_expr_equal(rule.get('expr'),expected)
+    else:
+        expressions_ok=rule.get('expr')==expected
+    return rule.get('chain')==chain and rule.get('comment')==name and expressions_ok
 
 
 def reconcile(current,selected,snapshot,counts):
@@ -74,15 +83,19 @@ def reconcile(current,selected,snapshot,counts):
             if counter is None:
                 counter=f't_{n["key"]}_{uuid.uuid4().hex[:16]}_{direction}'
                 commands.append(f'add counter inet {TABLE} {counter}')
-            desired.append((chain,n['port'],counter))
+            desired.append((chain,n['port'],counter,None))
+            if udp_range(n):
+                desired.append((chain,n['port'],counter,n))
     rules=[v['rule'] for v in snapshot if 'rule' in v]
     if len(rules)!=len(desired) or not all(sum(matching(r,*want) for r in rules)==1 for want in desired):
         for chain in ('input','output'):
             commands.append(f'flush chain inet {TABLE} {chain}')
-        for chain,port,name in desired:
+        for chain,port,name,udp_node in desired:
             field='dport' if chain=='input' else 'sport'
-            commands.append(f'add rule inet {TABLE} {chain} tcp {field} {port} counter name {name} comment "{name}"')
-    retained={name for _,_,name in desired}
+            predicate=(udp_client_match(udp_node,chain) if udp_node is not None
+                       else f'tcp {field} {port}')
+            commands.append(f'add rule inet {TABLE} {chain} {predicate} counter name {name} comment "{name}"')
+    retained={name for _,_,name,_ in desired}
     for name in counts:
         if name not in retained:commands.append(f'delete counter inet {TABLE} {name}')
     return commands

@@ -32,6 +32,7 @@ RUN = Path(os.getenv('S5_RUN', '/run/socks5-manager'))
 UNITDIR = Path(os.getenv('S5_UNITS', '/etc/systemd/system'))
 BIN = os.getenv('S5_3PROXY', shutil.which('3proxy') or '/usr/bin/3proxy')
 TABLE_IP, TABLE_Q = 's5m_ip', 's5m_quota'
+TABLE_U = 's5m_udp'
 IP_CHAIN, Q_IN, Q_OUT = 'inbound', 'inbound', 'outbound'
 ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,47}\Z')
 PORT_MIN, PORT_MAX = 40000, 50050
@@ -51,7 +52,11 @@ def cmd(args, *, input=None, timeout=40, required=True):
     try:
         p = subprocess.run(list(map(str, args)), input=input, text=True,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=timeout, check=False)
+                           timeout=timeout, check=False,
+                           # nft renders absolute-time JSON in its local zone.
+                           # Pin only this child process so audits stay exact
+                           # across server timezones and DST clock changes.
+                           env={**os.environ,'TZ':'UTC'} if str(args[0])=='nft' else None)
     except (OSError, subprocess.TimeoutExpired) as e:
         if required: raise Fail(f'执行 {args[0]} 失败: {e}') from e
         return None
@@ -102,6 +107,13 @@ def nodes():
         result.append(node(p.stem))
     ports=[n['port'] for n in result]
     if len(set(ports))!=len(ports): raise Fail('节点使用相同监听端口，拒绝管理')
+    ranges=[]
+    for n in result:
+        bounds=udp_range(n)
+        if bounds is not None:
+            if any(bounds[0]<=hi and lo<=bounds[1] for lo,hi in ranges):
+                raise Fail('SOCKS5 UDP 中继端口范围重叠，拒绝管理')
+            ranges.append(bounds)
     return result
 
 def resolve_node(reference):
@@ -181,7 +193,8 @@ def prepare_dirs():
 
 def ensure_tables():
     defs = [(TABLE_IP,f'add table inet {TABLE_IP}\nadd chain inet {TABLE_IP} {IP_CHAIN} {{ type filter hook input priority -10; policy accept; }}\n'),
-            (TABLE_Q,f'add table inet {TABLE_Q}\nadd chain inet {TABLE_Q} {Q_IN} {{ type filter hook input priority 0; policy accept; }}\nadd chain inet {TABLE_Q} {Q_OUT} {{ type filter hook output priority 0; policy accept; }}\n')]
+            (TABLE_Q,f'add table inet {TABLE_Q}\nadd chain inet {TABLE_Q} {Q_IN} {{ type filter hook input priority 0; policy accept; }}\nadd chain inet {TABLE_Q} {Q_OUT} {{ type filter hook output priority 0; policy accept; }}\n'),
+            (TABLE_U,f'add table inet {TABLE_U}\nadd chain inet {TABLE_U} {Q_IN} {{ type filter hook input priority -20; policy accept; }}\nadd chain inet {TABLE_U} {Q_OUT} {{ type filter hook output priority -20; policy accept; }}\n')]
     for table,body in defs:
         if cmd(['nft','-j','list','table','inet',table],required=False) is None:
             cmd(['nft','-f','-'],input=body)
@@ -224,8 +237,221 @@ def execute_batch(lines):
 def quota_names(port): return f's5m_ci_{port}',f's5m_co_{port}',f's5m_q_{port}'
 def ip_name(port): return f's5m_i4_{port}'
 
+def udp_range(n):
+    """Optional inclusive relay range. Missing metadata keeps legacy TCP-only."""
+    value=n.get('udp_range')
+    if value is None:return None
+    if (not isinstance(value,(list,tuple)) or len(value)!=2
+        or any(type(x) is not int for x in value)
+        or not 1024<=value[0]<=value[1]<=65535 or value[1]-value[0]>=256):
+        raise Fail('UDP 中继范围必须为 1024..65535 内的连续 1～256 个端口')
+    return tuple(value)
+
+
+def udp_slice(n):
+    instance=n.get('instance')
+    if not isinstance(instance,str) or not re.fullmatch(r'[0-9a-f]{32}',instance):
+        raise Fail('UDP 账号实例身份无效')
+    return 's5u'+instance+'.slice'
+
+
+def udp_external_range(n):
+    """Separate destination-side sockets from this account's client relays."""
+    internal=udp_range(n)
+    if internal is None:return None
+    value=n.get('udp_ext_range')
+    if value is None:
+        try:
+            ephemeral=[int(x) for x in Path('/proc/sys/net/ipv4/ip_local_port_range').read_text().split()]
+        except (OSError,ValueError) as exc:raise Fail('无法读取 UDP 出站端口范围') from exc
+        if len(ephemeral)!=2 or not 1024<=ephemeral[0]<=internal[0]<=internal[1]<=ephemeral[1]<=65535:
+            raise Fail('UDP 中继范围必须位于当前系统临时端口范围内')
+        candidates=[(ephemeral[0],internal[0]-1),(internal[1]+1,ephemeral[1])]
+        candidates=[bounds for bounds in candidates if bounds[0]<=bounds[1]]
+        if not candidates:raise Fail('UDP 中继范围外没有可用的出站端口范围')
+        value=max(candidates,key=lambda bounds:bounds[1]-bounds[0])
+    if (not isinstance(value,(tuple,list)) or len(value)!=2
+        or any(type(x) is not int for x in value) or not 1024<=value[0]<=value[1]<=65535
+        or (value[0]<=internal[1] and internal[0]<=value[1])):
+        raise Fail('UDP 出站端口范围无效或与本账号中继范围重叠')
+    return tuple(value)
+
+
+def udp_client_match(n,chain):
+    bounds=udp_range(n)
+    if bounds is None:raise Fail('账号未启用 UDP')
+    incoming=chain in ('input',Q_IN)
+    if not incoming and chain not in ('output',Q_OUT):raise Fail('未知 UDP 方向')
+    direction,field=('original','dport') if incoming else ('reply','sport')
+    return (f'meta l4proto udp socket cgroupv2 level 1 "{udp_slice(n)}" '
+            f'ct direction {direction} udp {field} {bounds[0]}-{bounds[1]}')
+
+
+def udp_client_expr(n,chain):
+    incoming=chain in ('input',Q_IN)
+    if not incoming and chain not in ('output',Q_OUT):raise Fail('未知 UDP 方向')
+    bounds=udp_range(n)
+    if bounds is None:raise Fail('账号未启用 UDP')
+    return [
+        {'match':{'op':'==','left':{'meta':{'key':'l4proto'}},'right':'udp'}},
+        {'match':{'op':'==','left':{'socket':{'key':'cgroupv2'}},'right':udp_slice(n)}},
+        {'match':{'op':'==','left':{'ct':{'key':'direction'}},'right':'original' if incoming else 'reply'}},
+        {'match':{'op':'==','left':{'payload':{'protocol':'udp','field':'dport' if incoming else 'sport'}},
+                  'right':{'range':list(bounds)}}}]
+
+
+def _udp_expr_equal(actual,expected):
+    """Accept nft's redundant-protocol and singleton-range canonicalizations."""
+    if not isinstance(actual,list) or not isinstance(expected,list):return False
+    def lookup(value,*keys):
+        for key in keys:
+            if not isinstance(value,dict):return None
+            value=value.get(key)
+        return value
+    def normalized(items):
+        has_udp=any(lookup(x,'match','left','payload','protocol')=='udp' for x in items)
+        result=[]
+        for original in items:
+            try:item=json.loads(json.dumps(original))
+            except (TypeError,ValueError):return None
+            if has_udp and item=={'match':{'op':'==','left':{'meta':{'key':'l4proto'}},'right':'udp'}}:
+                continue
+            m=item.get('match') if isinstance(item,dict) else None
+            if isinstance(m,dict):
+                left=m.get('left')
+                if lookup(left,'socket','key')=='cgroupv2':
+                    if type(left['socket'].get('level',1)) is not int or left['socket'].get('level',1)!=1:return None
+                    left['socket'].pop('level',None)
+                    right=m.get('right')
+                    if isinstance(right,int):
+                        candidates=[]
+                        for exp in expected:
+                            em=lookup(exp,'match')
+                            if lookup(em,'left','socket','key')=='cgroupv2':
+                                er=em.get('right')
+                                if isinstance(er,str):candidates.append(er)
+                        matched=[]
+                        for path in candidates:
+                            try:
+                                if (Path('/sys/fs/cgroup')/path).stat().st_ino==right:matched.append(path)
+                            except OSError:pass
+                        if len(set(matched))!=1:return None
+                        m['right']=matched[0]
+                value=m.get('right')
+                if isinstance(value,dict) and set(value)=={'range'}:
+                    bounds=value['range']
+                    if isinstance(bounds,list) and len(bounds)==2 and bounds[0]==bounds[1]:m['right']=bounds[0]
+            result.append(item)
+        return result
+    first,second=normalized(actual),normalized(expected)
+    return first is not None and second is not None and first==second
+
+
+def _udp_scope_expr(n):return udp_client_expr(n,'input')[:2]
+
+
+def udp_deadline_epoch(n):
+    expires=n.get('expires')
+    if type(expires) is not int or not 0<expires<=18446744073:
+        raise Fail('UDP 账号到期时间无效')
+    return expires
+
+
+def _udp_deadline_json(n):
+    return dt.datetime.fromtimestamp(udp_deadline_epoch(n),dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _udp_guard_expr(n,kind):
+    incoming=kind.startswith('in')
+    if kind in ('inexpiry','outexpiry'):
+        return _udp_scope_expr(n)+[{'match':{'op':'>=','left':{'meta':{'key':'time'}},
+                                           'right':_udp_deadline_json(n)}},{'drop':None}]
+    if kind in ('indrop','outdrop'):return _udp_scope_expr(n)+[{'drop':None}]
+    result=udp_client_expr(n,'input' if incoming else 'output')
+    if kind not in ('inclient','outclient'):
+        result[2]['match']['right']='reply' if incoming else 'original'
+        result[3]['match']['op']='!='
+    return [{'match':{'op':'==','left':{'meta':{'key':'nfproto'}},'right':'ipv4'}}]+result+[{'accept':None}]
+
+
+def _udp_dropin_path(n):return UNITDIR/(service(n)+'.d')/'10-udp.conf'
+
+
+def _udp_dropin(n):return '[Service]\nSlice='+udp_slice(n)+'\n'
+
+
+def _udp_slice_unit():
+    # An inactive proxy has no stop job to carry its ordering to the parent
+    # slice. Protect the persistent slice directly while snapshots use it.
+    return ('[Unit]\nDescription=SOCKS5 UDP account slice\n'
+            'Before=socks5-shutdown.service socks5-traffic-shutdown.service\n'
+            'StopWhenUnneeded=no\n[Slice]\n')
+
+
+def prepare_udp(n):
+    """Keep a persistent parent cgroup; service restarts must not change its ID."""
+    if udp_range(n) is None:return
+    slice_name=udp_slice(n)
+    paths={UNITDIR/slice_name:_udp_slice_unit(),
+           _udp_dropin_path(n):_udp_dropin(n)}
+    changed=False
+    for path,body in paths.items():
+        if path.is_symlink() or path.parent.is_symlink():raise Fail('UDP systemd 配置不允许符号链接')
+        if not path.exists() or path.read_text()!=body:
+            atomic_write(path,body.encode(),0o644);changed=True
+    if changed:systemctl('daemon-reload')
+    systemctl('start',slice_name)
+    if not (Path('/sys/fs/cgroup')/slice_name).is_dir():raise Fail('UDP 需要 cgroup v2 根 slice')
+
+
+def apply_udp_guard(n):
+    if udp_range(n) is None:return
+    prepare_udp(n)
+    p=n['port'];lo,hi=udp_range(n);scope=f'meta l4proto udp socket cgroupv2 level 1 "{udp_slice(n)}"'
+    lines=delete_block(TABLE_U,p,'s5m-u-')
+    for chain,prefix,field,client_dir,server_dir in (
+            (Q_IN,'in','dport','original','reply'),(Q_OUT,'out','sport','reply','original')):
+        # A graceful SIGTERM may leave 3proxy relaying for a few seconds. The
+        # kernel deadline closes that gap without sacrificing its final logs.
+        # nft's numeric frontend takes epoch SECONDS (its kernel attribute is
+        # nanoseconds). Multiplying here would overflow and postpone expiry.
+        lines.append(f'add rule inet {TABLE_U} {chain} {scope} meta time >= {udp_deadline_epoch(n)} drop comment "s5m-u-{p}-{prefix}expiry"')
+        for kind,direction,op in ((prefix+'client',client_dir,''),(prefix+'server',server_dir,'!= ')):
+            lines.append(f'add rule inet {TABLE_U} {chain} meta nfproto ipv4 {scope} ct direction {direction} udp {field} {op}{lo}-{hi} accept comment "s5m-u-{p}-{kind}"')
+        lines.append(f'add rule inet {TABLE_U} {chain} {scope} drop comment "s5m-u-{p}-{prefix}drop"')
+    execute_batch(lines)
+
+
+def cleanup_udp(n):
+    if udp_range(n) is None:return
+    execute_batch(delete_block(TABLE_U,n['port'],'s5m-u-'))
+    systemctl('stop',udp_slice(n))
+    _udp_dropin_path(n).unlink(missing_ok=True)
+    try:_udp_dropin_path(n).parent.rmdir()
+    except OSError:pass
+    (UNITDIR/udp_slice(n)).unlink(missing_ok=True)
+    systemctl('daemon-reload')
+    # A failed first UDP account must not leave a new chain which an older
+    # TCP-only manager would reject after the installer restores its binary.
+    remaining=[owner for owner in nodes() if owner.get('instance')!=n['instance'] and udp_range(owner) is not None]
+    if not remaining:
+        snap=nft_table(TABLE_IP)
+        output=[row['chain'] for row in snap if row.get('chain',{}).get('name')==Q_OUT]
+        if output and not any(row.get('rule',{}).get('chain')==Q_OUT for row in snap):
+            if not _nft_base_ok(snap,TABLE_IP):raise Fail('来源 IP 表结构异常，拒绝移除 UDP 输出链')
+            execute_batch([f'delete chain inet {TABLE_IP} {Q_OUT}'])
+
+
+def ensure_udp_ip_output():
+    current=nft_table(TABLE_IP)
+    if not _nft_base_ok(current,TABLE_IP):raise Fail('来源 IP 表结构异常，拒绝增加 UDP 输出链')
+    if not any(row.get('chain',{}).get('name')==Q_OUT for row in current):
+        execute_batch([f'add chain inet {TABLE_IP} {Q_OUT} {{ type filter hook output priority -10; policy accept; }}'])
+
+
 def apply_ip(n):
     port=n['port']; limit=n['ip_limit']; sticky=n['sticky']
+    if udp_range(n) is not None:ensure_udp_ip_output()
     lines=delete_block(TABLE_IP,port,'s5m-ip-')
     # Local authenticated health checks must not occupy a customer's IP slot.
     # Restrict exception to IPv4 loopback; IPv6 is still rejected.
@@ -239,6 +465,14 @@ def apply_ip(n):
             f'add rule inet {TABLE_IP} {IP_CHAIN} meta nfproto ipv4 tcp dport {port} ip saddr @{setname} update @{setname} {{ ip saddr timeout {sticky}s }} accept comment "s5m-ip-{port}-refresh"',
             f'add rule inet {TABLE_IP} {IP_CHAIN} meta nfproto ipv4 tcp dport {port} add @{setname} {{ ip saddr timeout {sticky}s }} accept comment "s5m-ip-{port}-claim"',
             f'add rule inet {TABLE_IP} {IP_CHAIN} meta nfproto ipv4 tcp dport {port} drop comment "s5m-ip-{port}-drop"'])
+    if udp_range(n) is not None and limit:
+        setname=ip_name(port)
+        for chain,field,prefix in ((IP_CHAIN,'saddr','udp'),(Q_OUT,'daddr','udpout')):
+            match=udp_client_match(n,chain)
+            lines.extend([
+                f'add rule inet {TABLE_IP} {chain} {match} ip {field} @{setname} update @{setname} {{ ip {field} timeout {sticky}s }} accept comment "s5m-ip-{port}-{prefix}refresh"',
+                f'add rule inet {TABLE_IP} {chain} {match} add @{setname} {{ ip {field} timeout {sticky}s }} accept comment "s5m-ip-{port}-{prefix}claim"',
+                f'add rule inet {TABLE_IP} {chain} {match} drop comment "s5m-ip-{port}-{prefix}drop"'])
     execute_batch(lines)
 
 def quota_remaining(n):
@@ -261,6 +495,13 @@ def apply_quota(n):
             lines.extend([
                 f'add rule inet {TABLE_Q} {Q_IN} tcp dport {p} drop comment "s5m-q-{p}-dropin"',
                 f'add rule inet {TABLE_Q} {Q_OUT} tcp sport {p} drop comment "s5m-q-{p}-dropout"'])
+        if udp_range(n) is not None:
+            for chain,suffix,counter in ((Q_IN,'in',ci),(Q_OUT,'out',co)):
+                match=udp_client_match(n,chain)
+                quota=f'quota name "{qn}" ' if remain>0 else ''
+                lines.append(f'add rule inet {TABLE_Q} {chain} {match} {quota}drop comment "s5m-q-{p}-udpdrop{suffix}"')
+                if remain>0:
+                    lines.append(f'add rule inet {TABLE_Q} {chain} {match} counter name "{counter}" comment "s5m-q-{p}-udpcount{suffix}"')
     execute_batch(lines)
 
 def ensure_block(n):
@@ -272,6 +513,13 @@ def ensure_block(n):
         lines.extend([
             f'add rule inet {TABLE_IP} {IP_CHAIN} tcp dport {p} drop comment "s5m-ip-{p}-failsafe"',
             f'add rule inet {TABLE_Q} {Q_OUT} tcp sport {p} drop comment "s5m-q-{p}-failsafe"'])
+        if udp_range(n) is not None:
+            # Block all UDP sockets belonging to this account, including relay
+            # ports allocated outside its range after exhaustion.
+            scope=f'meta l4proto udp socket cgroupv2 level 1 "{udp_slice(n)}"'
+            lines+=delete_block(TABLE_U,p,'s5m-u-')
+            for chain,suffix in ((Q_IN,'in'),(Q_OUT,'out')):
+                lines.append(f'add rule inet {TABLE_U} {chain} {scope} drop comment "s5m-u-{p}-{suffix}failsafe"')
         execute_batch(lines)
     finally:
         # If nft is unavailable we still stop the process. If process stop
@@ -280,7 +528,19 @@ def ensure_block(n):
 
 
 def snapshot_pair():
-    return {TABLE_IP:nft_table(TABLE_IP),TABLE_Q:nft_table(TABLE_Q)}
+    result={TABLE_IP:nft_table(TABLE_IP),TABLE_Q:nft_table(TABLE_Q)}
+    for table in (TABLE_IP,TABLE_Q):
+        if any('udp' in row.get('rule',{}).get('comment','').rsplit('-',1)[-1] for row in result[table]):
+            result[table+'_text']=cmd(['nft','list','table','inet',table])
+    # Legacy TCP-only callers and old installations need not have the new table.
+    try:
+        result[TABLE_U]=nft_table(TABLE_U)
+        # nft JSON currently omits the cgroup ancestor level. Preserve its text
+        # form too, so a numeric cgroup match at a wrong level cannot pass audit.
+        if any('rule' in row for row in result[TABLE_U]):
+            result[TABLE_U+'_text']=cmd(['nft','list','table','inet',TABLE_U])
+    except Fail:pass
+    return result
 
 def named_object(snapshot,kind,name):
     for item in snapshot:
@@ -353,7 +613,7 @@ def _nft_named(expr, kind, name):
     return isinstance(expr,dict) and set(expr)=={kind} and _nft_ref(expr[kind],name)
 
 
-def _nft_dynset(expr, mode, name, sticky):
+def _nft_dynset(expr, mode, name, sticky, field='saddr'):
     if not isinstance(expr,dict) or set(expr)!={'set'}:return False
     obj=expr['set']
     if not isinstance(obj,dict) or obj.get('op')!=mode or not _nft_ref(obj.get('set'),name):return False
@@ -365,7 +625,7 @@ def _nft_dynset(expr, mode, name, sticky):
     # Unwrap exactly one recognized layer; still verify source, set and timeout.
     if set(elem)=={'elem'} and isinstance(elem['elem'],dict):
         elem=elem['elem']
-    source={'payload':{'protocol':'ip','field':'saddr'}}
+    source={'payload':{'protocol':'ip','field':field}}
     if elem==source:return True
     # nft JSON encodes per-element timeout as seconds or milliseconds depending
     # on libnftables version; do not accept a different source expression.
@@ -377,11 +637,11 @@ def _nft_dynset(expr, mode, name, sticky):
     return True
 
 
-def _nft_set_member(expr, name):
+def _nft_set_member(expr, name, field='saddr'):
     if not isinstance(expr,dict) or set(expr)!={'match'}:return False
     m=expr['match']
     return (isinstance(m,dict) and m.get('op') in ('==','in')
-            and m.get('left')=={'payload':{'protocol':'ip','field':'saddr'}}
+            and m.get('left')=={'payload':{'protocol':'ip','field':field}}
             and _nft_ref(m.get('right'),name))
 
 
@@ -390,6 +650,8 @@ def _nft_rule_valid(rule, n, kind):
     expr=rule.get('expr')
     if not isinstance(expr,list):return False
     if rule.get('family','inet')!='inet':return False
+    if kind.startswith('udp') or rule.get('table')==TABLE_U:
+        return _nft_udp_rule_valid(rule,n,kind)
     if kind in ('local','family','refresh','claim','drop'):
         if rule.get('table',TABLE_IP)!=TABLE_IP or rule.get('chain')!=IP_CHAIN:return False
         if kind=='family':
@@ -435,9 +697,52 @@ def _nft_rule_valid(rule, n, kind):
     return False
 
 
+def _nft_udp_rule_valid(rule,n,kind):
+    if udp_range(n) is None:return False
+    table=rule.get('table');chain=rule.get('chain');actual=rule.get('expr')
+    if table==TABLE_U:
+        expected_chain=Q_IN if kind.startswith('in') else Q_OUT
+        if chain!=expected_chain or kind not in ('inexpiry','inclient','inserver','indrop','outexpiry','outclient','outserver','outdrop'):
+            return False
+        return _udp_expr_equal(actual,_udp_guard_expr(n,kind))
+    if table==TABLE_IP:
+        if chain not in (IP_CHAIN,Q_OUT) or not n['ip_limit']:return False
+        # `ip saddr` makes this an IPv4 rule; nft may materialize that implied
+        # family before the explicitly written UDP predicate.
+        if isinstance(actual,list) and actual and _nft_family(actual[0],'ipv4'):actual=actual[1:]
+        prefix=udp_client_expr(n,chain);s=ip_name(n['port'])
+        label,field=('udp','saddr') if chain==IP_CHAIN else ('udpout','daddr')
+        if kind==label+'refresh':
+            # Dynamic set JSON representation varies between libnft versions.
+            return (isinstance(actual,list) and len(actual)>=3
+                    and _udp_expr_equal(actual[:-3],prefix)
+                    and _nft_set_member(actual[-3],s,field)
+                    and _nft_dynset(actual[-2],'update',s,n['sticky'],field)
+                    and _nft_action(actual[-1],'accept'))
+        if kind==label+'claim':
+            return (isinstance(actual,list) and len(actual)>=2
+                    and _udp_expr_equal(actual[:-2],prefix)
+                    and _nft_dynset(actual[-2],'add',s,n['sticky'],field)
+                    and _nft_action(actual[-1],'accept'))
+        return kind==label+'drop' and _udp_expr_equal(actual,prefix+[{'drop':None}])
+    if table!=TABLE_Q or chain not in (Q_IN,Q_OUT):return False
+    if n['quota'] is None:return False
+    suffix='in' if chain==Q_IN else 'out';prefix=udp_client_expr(n,chain)
+    ci,co,qn=quota_names(n['port']);remain=quota_remaining(n)
+    if kind=='udpdrop'+suffix:
+        tail=([{'quota':qn}] if remain>0 else [])+[{'drop':None}]
+        return _udp_expr_equal(actual,prefix+tail)
+    if kind=='udpcount'+suffix and remain>0:
+        return _udp_expr_equal(actual,prefix+[{'counter':ci if chain==Q_IN else co}])
+    return False
+
+
 def _nft_base_ok(snap, table):
-    chain_specs=({IP_CHAIN:('input',-10)} if table==TABLE_IP
-                 else {Q_IN:('input',0),Q_OUT:('output',0)})
+    chain_specs=({IP_CHAIN:('input',-10)} if table==TABLE_IP else
+                 {Q_IN:('input',-20),Q_OUT:('output',-20)} if table==TABLE_U else
+                 {Q_IN:('input',0),Q_OUT:('output',0)})
+    if table==TABLE_IP and any(row.get('chain',{}).get('name')==Q_OUT for row in snap):
+        chain_specs={**chain_specs,Q_OUT:('output',-10)}
     tables=[v['table'] for v in snap if 'table' in v]
     if len(tables)!=1 or tables[0].get('family')!='inet' or tables[0].get('name')!=table:
         return False
@@ -454,9 +759,18 @@ def _nft_base_ok(snap, table):
     return True
 
 
-def _nft_rules_ok(snap, table, n, expected):
+def _udp_text_rule_ok(text,rule,n):
+    if not isinstance(text,str):return False
+    marker='comment "'+rule['comment']+'"'
+    selected=[line for line in text.splitlines() if marker in line]
+    needle=f'socket cgroupv2 level 1 "{udp_slice(n)}"'
+    return (len(selected)==1 and selected[0].count('socket cgroupv2 ')==1
+            and needle in selected[0])
+
+
+def _nft_rules_ok(snap, table, n, expected,text=None):
     """Validate exact expressions and order; reject foreign/wildcard shortcuts."""
-    prefix='s5m-ip-' if table==TABLE_IP else 's5m-q-'
+    prefix='s5m-ip-' if table==TABLE_IP else 's5m-u-' if table==TABLE_U else 's5m-q-'
     port=n['port']
     selected=[]
     for index,entry in enumerate(snap):
@@ -468,30 +782,44 @@ def _nft_rules_ok(snap, table, n, expected):
         # an earlier/later restriction. Never accept external rules in them.
         if not isinstance(comment,str) or not re.fullmatch(prefix+r'[0-9]{1,5}-[a-z]+',comment):
             return False
-        if r.get('chain') not in ({IP_CHAIN} if table==TABLE_IP else {Q_IN,Q_OUT}):return False
+        if r.get('chain') not in {Q_IN,Q_OUT}:return False
         ruleport=int(comment[len(prefix):].split('-',1)[0])
         if not 1<=ruleport<=65535:return False
         if ruleport==port:
             if type(r.get('handle')) is not int:return False
             kind=comment.rsplit('-',1)[1]
             if kind not in expected or not _nft_rule_valid(r,n,kind):return False
+            if table==TABLE_U or kind.startswith('udp'):
+                if text is None:text=cmd(['nft','list','table','inet',table],required=False)
+                if not _udp_text_rule_ok(text,r,n):return False
             selected.append((index,kind))
         else:
             # A rule claiming another port must actually match that port,
             # never a wildcard or our port (which could grant early accept).
             expr=r.get('expr')
             if not isinstance(expr,list):return False
+            kind=comment.rsplit('-',1)[1]
+            if table==TABLE_U or kind.startswith('udp'):
+                owners=[owner for owner in nodes() if owner['port']==ruleport]
+                if len(owners)!=1 or not _nft_udp_rule_valid(r,owners[0],kind):return False
+                if text is None:text=cmd(['nft','list','table','inet',table],required=False)
+                if not _udp_text_rule_ok(text,r,owners[0]):return False
+                continue
             if table==TABLE_IP:
+                if r['chain']!=IP_CHAIN:return False
                 if not any(_nft_tcp_port(x,'dport',ruleport) for x in expr):return False
             elif not any(_nft_tcp_port(x,'dport' if r['chain']==Q_IN else 'sport',ruleport) for x in expr):
                 return False
     return [kind for _,kind in selected]==list(expected)
 
 
-def _nft_ip_ok(n, snap):
+def _nft_ip_ok(n, snap,text=None):
     if not _nft_base_ok(snap,TABLE_IP):return False
     expected=(('local','family','refresh','claim','drop') if n['ip_limit'] else ('family',))
-    if not _nft_rules_ok(snap,TABLE_IP,n,expected):return False
+    if udp_range(n) is not None:
+        if not any(row.get('chain',{}).get('name')==Q_OUT for row in snap):return False
+        if n['ip_limit']:expected+=('udprefresh','udpclaim','udpdrop','udpoutrefresh','udpoutclaim','udpoutdrop')
+    if not _nft_rules_ok(snap,TABLE_IP,n,expected,text):return False
     matching=[v['set'] for v in snap if 'set' in v and v['set'].get('name')==ip_name(n['port'])]
     if not n['ip_limit']:return not matching
     if len(matching)!=1:return False
@@ -507,14 +835,17 @@ def _nft_ip_ok(n, snap):
     return True
 
 
-def _nft_quota_ok(n, snap):
+def _nft_quota_ok(n, snap,text=None):
     if not _nft_base_ok(snap,TABLE_Q):return False
     remain=quota_remaining(n)
     expected=(('dropin','countin','dropout','countout') if remain is not None and remain>0
               else ('dropin','dropout') if remain==0 else ())
+    if udp_range(n) is not None and remain is not None:
+        expected=(('dropin','countin','udpdropin','udpcountin','dropout','countout','udpdropout','udpcountout')
+                  if remain>0 else ('dropin','udpdropin','dropout','udpdropout'))
     # Rule evaluation order is per chain, not across the two base chains.
     # _nft_rules_ok uses full nft dump order, generally preserving per-chain order.
-    if not _nft_rules_ok(snap,TABLE_Q,n,expected):return False
+    if not _nft_rules_ok(snap,TABLE_Q,n,expected,text):return False
     ci,co,qn=quota_names(n['port'])
     found={}
     for objkind in ('counter','quota'):
@@ -533,12 +864,24 @@ def _nft_quota_ok(n, snap):
                for name in (ci,co))
 
 
+def _nft_udp_ok(n,snap,text=None):
+    if not _nft_base_ok(snap,TABLE_U):return False
+    if not (Path('/sys/fs/cgroup')/udp_slice(n)).is_dir():return False
+    try:
+        if _udp_dropin_path(n).read_text()!=_udp_dropin(n):return False
+    except OSError:return False
+    expected=('inexpiry','inclient','inserver','indrop','outexpiry','outclient','outserver','outdrop')
+    return _nft_rules_ok(snap,TABLE_U,n,expected,text)
+
+
 def ready(n,snaps=None):
     if n.get('pending') or n.get('pending_ip') or n.get('phase') not in ('active','creating'):
         return False
     try:
         if snaps is None:snaps=snapshot_pair()
-        return _nft_ip_ok(n,snaps[TABLE_IP]) and _nft_quota_ok(n,snaps[TABLE_Q])
+        return (_nft_ip_ok(n,snaps[TABLE_IP],snaps.get(TABLE_IP+'_text'))
+                and _nft_quota_ok(n,snaps[TABLE_Q],snaps.get(TABLE_Q+'_text'))
+                and (udp_range(n) is None or _nft_udp_ok(n,snaps.get(TABLE_U,[]),snaps.get(TABLE_U+'_text'))))
     except (Fail,ValueError,TypeError,KeyError,IndexError,AttributeError):return False
 
 
@@ -611,17 +954,30 @@ def proxy_config(n,s,*,access_log=True):
            f'users {u}:CL:{pwd}', 'auth strong',
            f'connlim {n["connections"]} 0 {u}',
            'connlim 120 60 '+u]
+    if udp_range(n) is not None:
+        # The process's own resolver must not be mistaken for client UDP.
+        lines.insert(2,'nserver 1.1.1.1/tcp')
     if access_log:
         # 3proxy writes to stdout; systemd journal owns access history.
         # %t epoch | marker | error | client IP/port | hostname | target IP/port | bytes
         # '- +_' sanitizes user-supplied spaces as recommended by 3proxy docs.
         lines.extend(['log', 'logformat "- +_G%t S5AUDIT %E %C %c %n %R %r %I %O"'])
     # Restrict both requested private addresses and hostnames that resolve to private IPs.
-    lines.append(f'deny {u} * {",".join(BLOCKED)} * CONNECT')
+    operations='CONNECT,UDPASSOC' if udp_range(n) is not None else 'CONNECT'
+    lines.append(f'deny {u} * {",".join(BLOCKED)} * {operations}')
     # SMTP abuse mitigation.
     lines.append(f'deny {u} * * 25,465,587 CONNECT')
-    lines.extend([f'deny {u} * * * UDPASSOC,BIND', f'allow {u} * * * CONNECT', 'deny *',
-                  f'socks -4 -p{p} -i0.0.0.0 -De{wan}', ''])
+    if udp_range(n) is None:
+        lines.extend([f'deny {u} * * * UDPASSOC,BIND', f'allow {u} * * * CONNECT', 'deny *',
+                      f'socks -4 -p{p} -i0.0.0.0 -De{wan}', ''])
+    else:
+        lo,hi=udp_range(n)
+        extlo,exthi=udp_external_range(n)
+        lines.extend([f'deny {u} * * * BIND',f'allow {u} * * * UDPASSOC',
+                      f'parent 1000 intport 0.0.0.0 {lo}-{hi}',
+                      f'parent 1000 extport 0.0.0.0 {extlo}-{exthi}',
+                      f'allow {u} * * * CONNECT','deny *',
+                      f'socks -4 -p{p} -i0.0.0.0 -De{wan} -Ni{public_host(n["public_host"])}',''])
     return '\n'.join(lines)
 
 def make_user(n,s):
@@ -799,6 +1155,7 @@ def make_units():
     template=f'''[Unit]
 Description=Managed residential SOCKS5 instance %i
 After=network-online.target socks5-restore.service
+Before=socks5-shutdown.service socks5-traffic-shutdown.service
 Wants=network-online.target
 ConditionPathExists={CONF}/nodes/%i.cfg
 ConditionPathExists={STATE}/nodes/%i.json
@@ -881,7 +1238,7 @@ WantedBy=multi-user.target
         'socks5-shutdown.service':f'''[Unit]
 Description=Save SOCKS5 quotas before shutdown
 Before=shutdown.target reboot.target halt.target poweroff.target
-After=local-fs.target
+After=local-fs.target nftables.service
 
 [Service]
 Type=oneshot
@@ -972,6 +1329,9 @@ def do_install(args):
                 if n['phase']=='creating':
                     systemctl('stop',service(n),required=False)
                     continue
+                # Upgrade the slice's own shutdown ordering even when all
+                # packet guards are healthy and repair_node can return early.
+                prepare_udp(n)
                 repair_node(n,manual_restore=True)
                 desired = proxy_config(n,s).encode()
                 cfg_path = proxycfg(n['id'])
@@ -1034,6 +1394,31 @@ def free_port(start,end,excluded=None,existing=None):
         if p not in occupied:return p
     raise Fail('没有空闲端口')
 
+def new_udp_range(value,existing):
+    if value is None:return None
+    if not isinstance(value,str) or not re.fullmatch(r'[0-9]{1,5}-[0-9]{1,5}',value):
+        raise Fail('--udp-range 格式为 START-END，例如 55000-55063')
+    bounds=udp_range({'udp_range':[int(x) for x in value.split('-')]})
+    for other in existing:
+        used=udp_range(other)
+        if used is not None and bounds[0]<=used[1] and used[0]<=bounds[1]:
+            raise Fail('UDP 中继范围与现有账号重叠')
+    try:
+        ephemeral=[int(x) for x in Path('/proc/sys/net/ipv4/ip_local_port_range').read_text().split()]
+    except (OSError,ValueError) as exc:raise Fail('无法核实系统 UDP 临时端口范围') from exc
+    if len(ephemeral)!=2 or not ephemeral[0]<=bounds[0]<=bounds[1]<=ephemeral[1]:
+        raise Fail(f'UDP 中继范围必须位于系统 ip_local_port_range {ephemeral} 内；本功能不会修改系统范围')
+    held=[]
+    try:
+        for port in range(bounds[0],bounds[1]+1):
+            sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);held.append(sock)
+            sock.bind(('0.0.0.0',port))
+    except OSError as exc:raise Fail(f'UDP 中继端口 {port} 已被占用：{exc}') from exc
+    finally:
+        for sock in held:sock.close()
+    return list(bounds)
+
+
 def make_node(args,excluded=None):
     s=settings();validate_iface(s['wan_if']);local_route(s['wan_if'])
     existing=nodes()
@@ -1064,6 +1449,10 @@ def make_node(args,excluded=None):
        'sticky':num(args.sticky,'IP_STICKY_SECONDS',1,2147483647),
        'connections':num(args.connections,'连接数',1,2048),'maxconn':num(args.maxconn,'maxconn',1,4096),
        'quota':q,'pending':False,'pending_ip':False,'phase':'creating'}
+    bounds=new_udp_range(getattr(args,'udp_range',None),existing)
+    if bounds is not None:
+        n['udp_range']=bounds
+        n['udp_ext_range']=list(udp_external_range(n))
     if n['public_host']=='AUTO':
         r=cmd(['ip','-4','addr','show','dev',s['wan_if']])
         found=re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)/',r)
@@ -1091,6 +1480,7 @@ def rollback_new(n):
     try:
         execute_batch(delete_block(TABLE_Q,n['port'],'s5m-q-'))
         execute_batch(delete_block(TABLE_IP,n['port'],'s5m-ip-'))
+        cleanup_udp(n)
     except Fail:raise Fail('创建失败且 nft 清理失败，保留状态以便 repair')
     proxycfg(n['id']).unlink(missing_ok=True)
     nodefile(n['id']).unlink(missing_ok=True)
@@ -1104,6 +1494,7 @@ def do_add(args):
             atomic_json(nodefile(n['id']),n)
             try:
                 make_user(n,settings());verify_proxycfg(n)
+                apply_udp_guard(n)
                 apply_ip(n);apply_quota(n)
                 if not ready(n):raise Fail('代理启动前防护状态不完整')
                 systemctl('enable',service(n))
@@ -1125,6 +1516,9 @@ def do_add(args):
                 print(f'用户名={n["username"]}\n密码={n["password"]}')
                 print(f'到期(北京时间)={dt.datetime.fromtimestamp(n["expires"],dt.timezone(dt.timedelta(hours=8))).isoformat()}')
                 print(f'IP_LIMIT={n["ip_limit"]}  STICKY={n["sticky"]}s')
+                if udp_range(n) is not None:
+                    lo,hi=udp_range(n)
+                    print(f'UDP 中继端口={lo}-{hi}；TCP/UDP 共用配额与 IP 名额；NAT 时必须同端口映射此 UDP 范围')
                 print(f'日常直接使用端口 {n["port"]} 管理：socks5 quota {n["port"]}（查余额） / socks5 link {n["port"]}（取链接）')
                 print(f'需要限速请在独立 portbw 中执行：portbw set {n["port"]} <上传Mbps> <下载Mbps>')
                 print(f'SOCKS5连接链接：{connection_link(n)}')
@@ -1165,19 +1559,42 @@ def socks_handshake(n):
             return c,reply
         except BaseException:
             c.close();raise
-    phase = 'UDP ASSOCIATE 拒绝检查'
-    with contextlib.closing(login(n['password'])[0]) as c:
-        # A wrong credential test guarantees the port isn't an open proxy.
-        c.sendall(b'\x05\x03\x00\x01'+b'\x00'*4+b'\x00'*2)
-        try:
-            reply=recv_exact(c,2)
-        except Fail as exc:
-            if 'SOCKS5 握手提前断开' not in str(exc):raise
-        except ConnectionResetError:
-            pass
-        else:
-            if reply[0]!=5 or reply[1]==0:
-                raise Fail('不允许 UDP ASSOCIATE，但实际代理未拒绝')
+    phase = 'UDP ASSOCIATE 检查'
+    if udp_range(n) is None:
+        with contextlib.closing(login(n['password'])[0]) as c:
+            c.sendall(b'\x05\x03\x00\x01'+b'\x00'*4+b'\x00'*2)
+            try:
+                reply=recv_exact(c,2)
+            except Fail as exc:
+                if 'SOCKS5 握手提前断开' not in str(exc):raise
+            except ConnectionResetError:
+                pass
+            else:
+                if reply[0]!=5 or reply[1]==0:
+                    raise Fail('不允许 UDP ASSOCIATE，但实际代理未拒绝')
+    else:
+        def can_associate(password):
+            try:
+                c,auth_reply=login(password)
+                with contextlib.closing(c):
+                    if auth_reply!=b'\x01\x00':return False
+                    c.sendall(b'\x05\x03\x00\x01'+b'\x00'*6)
+                    header=recv_exact(c,4)
+                    if header[0]!=5:raise Fail('UDP ASSOCIATE 回复版本错误')
+                    if header[1]!=0:return False
+                    if password!=n['password']:return True
+                    if header[2:]!=b'\x00\x01':raise Fail('UDP ASSOCIATE 需要 IPv4 中继回复')
+                    address=recv_exact(c,6)
+                    port=int.from_bytes(address[4:],'big');lo,hi=udp_range(n)
+                    if not lo<=port<=hi:
+                        raise Fail('UDP 中继端口超出账号范围；检查端口占用及 3proxy 1.0.3+ 支持')
+                    return True
+            except (Fail,OSError):
+                if password==n['password']:raise
+                return False
+        if not can_associate(n['password']):raise Fail('UDP ASSOCIATE 失败；需要支持 intport 的 3proxy 1.0.3+')
+        if can_associate(n['password']+'!invalid'):
+            raise Fail('安全错误：错误密码可以 UDP ASSOCIATE，拒绝创建账号')
     phase = '127.0.0.1 访问拒绝检查'
     with contextlib.closing(login(n['password'])[0]) as c:
         c.sendall(b'\x05\x01\x00\x01'+bytes([127,0,0,1])+bytes([0,80]))
@@ -1251,6 +1668,7 @@ def do_del(n, *, stop_post=False):
     # resources can still be found after partial failure.
     execute_batch(delete_block(TABLE_Q,n['port'],'s5m-q-'))
     execute_batch(delete_block(TABLE_IP,n['port'],'s5m-ip-'))
+    cleanup_udp(n)
     systemctl('disable',service(n),required=False)
     proxycfg(n['id']).unlink(missing_ok=True)
     nodefile(n['id']).unlink(missing_ok=True)
@@ -1310,6 +1728,7 @@ def repair_node(n, *, manual_restore=False, snaps=None):
     # Stop an already-running proxy before changing its guards.
     if systemctl('is-active','--quiet',service(n),required=False) is not None:
         systemctl('stop',service(n),required=False)
+    apply_udp_guard(n)
     if n.get('pending'):
         try:apply_quota(n)
         except Fail:ensure_block(n);raise
@@ -1332,7 +1751,7 @@ def ip_ready(n,snaps=None):
     """Inspect the real IP guard expressions, verdicts, order and set schema."""
     try:
         snap=nft_table(TABLE_IP) if snaps is None else snaps[TABLE_IP]
-        return _nft_ip_ok(n,snap)
+        return _nft_ip_ok(n,snap,snaps.get(TABLE_IP+'_text') if snaps is not None else None)
     except (Fail,TypeError,KeyError,ValueError,IndexError,AttributeError):return False
 
 
@@ -1362,12 +1781,17 @@ def operate(args):
         n=node(args.id)
         if n['expires']<=int(time.time()):return
         if not ready(n):raise Fail('防护不完整，拒绝启动 SOCKS5')
+        if udp_range(n) is not None:
+            membership=Path('/proc/self/cgroup').read_text().splitlines()
+            if not any(line.startswith('0::/'+udp_slice(n)+'/') for line in membership):
+                raise Fail('UDP 服务不在账号专用 cgroup 内，拒绝启动')
         s=settings();validate_iface(s['wan_if']);local_route(s['wan_if'])
         verify_proxycfg(n)  # Never start 3proxy with a modified/unaudited ACL.
-        seconds=max(0,n['expires']-int(time.time()))
+        seconds=max(0,n['expires']-(time.time() if udp_range(n) is not None else int(time.time())))
         if not seconds:return
         # timeout enforces exact epoch while GC performs final cleanup.
-        os.execv('/usr/bin/timeout',['timeout','--foreground',str(seconds),BIN,str(proxycfg(args.id))])
+        duration=f'{seconds:.6f}' if udp_range(n) is not None else str(seconds)
+        os.execv('/usr/bin/timeout',['timeout','--foreground',duration,BIN,str(proxycfg(args.id))])
     if action=='stop-post':
         with locked(nonblocking=True) as ok:
             if not ok:return
@@ -1562,6 +1986,7 @@ def parser():
     p.add_argument('--port-end',default=os.getenv('PORT_END',str(PORT_MAX)))
     p.add_argument('--public-port',type=int);p.add_argument('--host')
     p.add_argument('--connections',default='64');p.add_argument('--maxconn',default='128')
+    p.add_argument('--udp-range',help='可选：启用 UDP 的独占中继端口范围 START-END（最多256个端口，需要3proxy 1.0.3+及cgroup v2）')
     p.add_argument('--max-start-retries',default=os.getenv('MAX_START_RETRIES','12'))
     for name in ('status','save','gc','reset','watch','restore','ddns-check','ddns-status'):sub.add_parser(name)
     sub.add_parser('list')
