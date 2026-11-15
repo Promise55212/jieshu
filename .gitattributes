@@ -1,7 +1,0 @@
-# These files are deployed to Linux and verified by their exact bytes.
-/socks5.py text eol=lf
-/socks5-traffic.py text eol=lf
-/socks5-audit.py text eol=lf
-/socks5-install.sh text eol=lf
-/tests/test_socks5_udp_core.py text eol=lf
-/tests/test_socks5_udp_traffic.py text eol=lf
