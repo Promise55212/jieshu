@@ -1022,6 +1022,12 @@ cat /root/vless_reality_vision_url.txt
 XRAY_VERSION=vX.Y.Z bash /root/onekey_reality_ipv4.sh
 ```
 
+查看当前安装的 Xray 版本（只读，不会修改服务器）：
+
+```bash
+/usr/local/bin/xray version | head -n 1
+```
+
 </details>
 
 ### 4. 怎样确认安装成功
