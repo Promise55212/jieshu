@@ -442,6 +442,38 @@ PORT=40000 GIB=100 bash -c 'set -Eeuo pipefail; source /usr/local/lib/vless-real
 
 </details>
 
+<a id="quota-set-current-remaining"></a>
+
+### 临时修改本期剩余流量（下周期自动恢复）
+
+适用于**已有有效的 30 天自动重置周期**的 VLESS 临时节点。比如某端口原始每期配额为 `200 GiB`，本期希望**从现在开始还可使用 `85 GiB`**：只需修改下面命令开头的 `PORT=40013`（节点端口）和 `LEFT_GIB=85`（希望设置的**当前剩余流量**，单位 GiB），然后用 root 在 VLESS VPS 终端复制**完整单行**执行。无需修改 `jieshu` 源码，不安装新脚本，不额外创建备份或防重复标记文件。
+
+<details>
+<summary>展开：一行设置当前剩余流量（只改 PORT 和 LEFT_GIB）</summary>
+
+```bash
+PORT=40013 LEFT_GIB=85 bash -c 'set -Eeuo pipefail; (( EUID == 0 )) || { echo "请用root执行"; exit 1; }; source /usr/local/lib/vless-reality/common.sh; source /usr/local/lib/vless-reality/quota-lib.sh; [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || vr_die "端口无效"; WANT="$(vr_parse_gib_to_bytes "$LEFT_GIB")" || vr_die "剩余流量无效"; (( WANT > 0 )) || vr_die "剩余流量必须大于0"; vr_ensure_runtime_dirs; vr_acquire_lock_fd 7 "${VR_LOCK_DIR}/temp.lock" 120 "节点锁繁忙"; export VR_TEMP_LOCK_HELD=1; vr_pq_lock; T="$(vr_temp_meta_by_port "$PORT")"; Q="$(vr_quota_meta_file "$PORT")"; [[ -n "$T" && -f "$Q" ]] || vr_die "节点或配额不存在"; TAG="$(vr_meta_get "$T" TAG)"; [[ "$(vr_meta_get "$Q" OWNER_KIND)" == temp && "$(vr_meta_get "$Q" OWNER_TAG)" == "$TAG" && "$(vr_meta_get "$Q" PORT)" == "$PORT" ]] || vr_die "配额归属异常"; ORIG="$(vr_meta_get "$Q" ORIGINAL_LIMIT_BYTES)"; [[ "$ORIG" =~ ^[0-9]+$ && "$(vr_meta_get "$T" PQ_LIMIT_BYTES)" == "$ORIG" && "$(vr_meta_get "$Q" REBUILD_PENDING)" == 0 ]] || vr_die "配额元数据异常"; (( WANT <= ORIG )) || vr_die "剩余不能超过原始周期配额"; NEXT="$(vr_meta_get "$Q" NEXT_RESET_EPOCH)"; INTERVAL="$(vr_meta_get "$Q" RESET_INTERVAL_SECONDS)"; EXPIRE="$(vr_meta_get "$Q" EXPIRE_EPOCH)"; DURATION="$(vr_meta_get "$Q" DURATION_SECONDS)"; CREATED="$(vr_meta_get "$Q" CREATED_EPOCH)"; LAST="$(vr_meta_get "$Q" LAST_RESET_EPOCH)"; for V in "$NEXT" "$INTERVAL" "$EXPIRE" "$DURATION" "$CREATED" "$LAST"; do [[ "$V" =~ ^[0-9]+$ ]] || vr_die "时间元数据异常"; done; NOW="$(date +%s)"; (( INTERVAL > 0 && NEXT > NOW && EXPIRE > NOW )) || vr_die "无有效的未来自动重置"; IFS="|" read -r STATE TOTAL USED LEFT <<< "$(vr_pq_snapshot_unlocked "$PORT")"; [[ "$STATE" == active || "$STATE" == exhausted ]] && [[ "$TOTAL" == "$ORIG" ]] || vr_die "实时配额异常"; NEW_USED=$((ORIG-WANT)); vr_pq_write_meta "$PORT" "$ORIG" "$NEW_USED" "$WANT" temp "$TAG" "$DURATION" "$EXPIRE" "$NEXT" "$INTERVAL" "$CREATED" "$LAST" "$NOW" 1; vr_pq_rebuild_port "$PORT" "$WANT"; vr_meta_upsert "$Q" REBUILD_PENDING 0; vr_pq_unlock; echo "端口 $PORT 已设置当前剩余 ${LEFT_GIB} GiB；下周期恢复 $((ORIG/1073741824)) GiB"; TZ=Asia/Shanghai date -d "@$NEXT" "+下次重置：%F %T（北京时间）"'
+```
+
+</details>
+
+**效果与原理：** 原始周期配额仍为 `200 GiB`；命令将当前计费已用量直接设为 `200 - 85 = 115 GiB`，并将可用剩余额度设为 `85 GiB`。它是**直接设置剩余量**，不是在已有剩余量基础上再次扣减，也不会把 `85 GiB` 当作“本期总额度”。后续使用会继续消耗这 `85 GiB`；下次正常自动重置时，系统按未改动的原始配额恢复 `200 GiB`，之后仍按原周期重置（每 `30×24` 小时，而非每个自然月 1 日）。
+
+**副作用与注意事项：**
+
+- `pq_audit.sh` / `vless_audit.sh` 显示的 `USED` 是**计费已用量**，可能包含人为调整造成的虚拟用量，并不等于实际消耗；真实每日流量另看 `vless_traffic`，其独立历史不会被这条命令清零。
+- 不改变节点端口、UUID、连接链接、到期时间、原始配额和下一次自动重置时间。只更新原有配额元数据文件 `/var/lib/vless-reality/quota/<端口>.env`，并重建该端口的 nftables 配额规则；不会额外生成备份/标记文件，但**并非系统层面的完全无痕**，终端历史或系统日志仍可能留下记录。
+- 同一周期**再次执行也会重新把剩余量设为指定值**，可能给用户补回已消耗流量；非有意补额时不要重复执行。执行时可能有短暂计数窗口，正在使用的流量会使实际查询的剩余量略低于设置值。
+- 对 `qianyi`：该方式保留标准配额结构，迁移会携带当时的计费已用量和剩余额度（虚拟用量也包括在内）；迁移时如已到重置时刻，目标机会执行到期重置。迁移后不要误把计费已用量当作真实流量。
+- 命令有归属、额度及重置时间校验；如果中途执行失败，**不要盲目重试**，先查询配额状态并排查。此一次性做法尚未在所有实际 VPS 环境中验证。
+
+修改后核对：
+
+```bash
+vless_audit.sh
+pq_audit.sh
+```
+
 <a id="quota-reset-time"></a>
 
 <details>
