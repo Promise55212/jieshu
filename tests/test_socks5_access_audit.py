@@ -234,7 +234,7 @@ class InstallerReleaseRefTests(unittest.TestCase):
         installer = (ROOT / "socks5-install.sh").read_text(encoding="utf8")
         self.assertIn('S5_SOURCE_REF="${S5_SOURCE_REF:-main}"', installer)
         self.assertIn("main|feature/socks5-access-audit)", installer)
-        self.assertIn('RAW="https://raw.githubusercontent.com/liucong552-art/jieshu/$S5_SOURCE_REF"', installer)
+        self.assertIn('RAW="https://raw.githubusercontent.com/Promise55212/jieshu/$S5_SOURCE_REF"', installer)
 
     def test_installer_sha256_pins_match_source_files(self):
         import hashlib

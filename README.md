@@ -999,7 +999,7 @@ apt-get update && apt-get install -y curl ca-certificates nano
 依赖安装成功后，下载并安装管理工具（修改系统）：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vless.sh' -o /root/vless.sh && chmod 700 /root/vless.sh && bash /root/vless.sh
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/vless.sh' -o /root/vless.sh && chmod 700 /root/vless.sh && bash /root/vless.sh
 ```
 
 ### 2. 修改配置
@@ -1096,7 +1096,7 @@ WG-NAT 让 VLESS VPS 上的指定临时节点通过另一台机器的公网 IPv4
 在 **NAT 出口机** 执行（下载脚本并初始化 WG，可能影响现有连接）：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
 ```
 
 无法识别公网网卡时：
@@ -1110,7 +1110,7 @@ WAN_IF=eth0 bash /root/nat.sh init
 在 **VLESS VPS** 执行（下载脚本并修改 WG 配置及路由）：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vpswg.sh' -o /root/vpswg.sh && chmod 700 /root/vpswg.sh && bash /root/vpswg.sh
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/vpswg.sh' -o /root/vpswg.sh && chmod 700 /root/vpswg.sh && bash /root/vpswg.sh
 ```
 
 脚本会输出 VPS WireGuard 公钥。以后忘记时，在 **VLESS VPS** 查询：
@@ -1162,7 +1162,7 @@ OK EXIT_IP=x.x.x.x
 在 **VLESS VPS** 执行（下载脚本并安装 / 更新 WG-NAT 节点工具）：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/natjichang.sh' -o /root/natjichang.sh && chmod 700 /root/natjichang.sh && bash /root/natjichang.sh
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/natjichang.sh' -o /root/natjichang.sh && chmod 700 /root/natjichang.sh && bash /root/natjichang.sh
 ```
 
 ### NAT 出口机管理
@@ -1257,7 +1257,7 @@ wg show wg-exit latest-handshakes
 在 VLESS VPS 下载并安装 / 更新统计组件：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/traffic.py' -o /root/vless_traffic.py && python3 /root/vless_traffic.py --install
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/traffic.py' -o /root/vless_traffic.py && python3 /root/vless_traffic.py --install
 ```
 
 </details>
@@ -1280,8 +1280,8 @@ apt-get update && apt-get install -y curl ca-certificates python3 iproute2 nftab
 依赖安装成功后，下载两个配套文件；以下命令仅下载，不安装、不创建限速策略：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/portbw-install.sh' -o /root/portbw-install.sh && \
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/portbw.py' -o /root/portbw.py
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/portbw-install.sh' -o /root/portbw-install.sh && \
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/portbw.py' -o /root/portbw.py
 ```
 
 两次下载均成功后再继续。已有 portbw 的主机应看下面的升级说明，不要执行新安装流程。
@@ -1362,7 +1362,7 @@ portbw audit
 
 ```bash
 apt-get update && apt-get install -y curl ca-certificates
-AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/socks5-install.sh') install
+AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/socks5-install.sh') install
 ```
 
 主机位于路由器 NAT 后面时，可以在 `install` 后加 `--host proxy.example.com`（换成自己的公网域名/IP）。必要时加 `--wan-if eth0` 指定物理出口网卡。
@@ -1370,7 +1370,7 @@ AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/
 **更新现有 SOCKS5 管理器（建议先做 VPS 快照；升级期间已有 3proxy 实例可能短暂重启）：**
 
 ```bash
-AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/socks5-install.sh') update
+AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/socks5-install.sh') update
 ```
 
 若 `/root/` 已放有本地 SOCKS5 配套源码，安装器可能优先使用它们，应核对是否为同一版本；SHA 不匹配时停止并核对文件，不能跳过校验。初次部署使用上方首次安装的 `install` 命令。日志采集使用每个 SOCKS5 实例自己的 journal，不改变其他端口的记录；`socks5-traffic` 每日统计和 `portbw` 限速按原章节独立管理。
@@ -1393,7 +1393,7 @@ socks5-traffic --install            # 首次开启或更新每日流量采集
 #### VLESS 管理工具
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vless.sh' -o /root/vless.sh && chmod 700 /root/vless.sh && bash /root/vless.sh
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/vless.sh' -o /root/vless.sh && chmod 700 /root/vless.sh && bash /root/vless.sh
 ```
 
 需要更新 Xray 主程序或重新应用主配置时：
@@ -1407,7 +1407,7 @@ bash /root/onekey_reality_ipv4.sh
 已安装统计组件时，在 **VLESS VPS** 重新执行以下命令即可更新：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/traffic.py' -o /root/vless_traffic.py && python3 /root/vless_traffic.py --install
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/traffic.py' -o /root/vless_traffic.py && python3 /root/vless_traffic.py --install
 ```
 
 无需删除历史数据，也无需重新安装主脚本。更新后运行 `vless_traffic`，标题应显示“今日”；运行 `vless_traffic main` 可查看主节点保留的每日明细。
@@ -1415,8 +1415,8 @@ curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/traffic
 #### VLESS VPS 的 WG-NAT 工具
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vpswg.sh' -o /root/vpswg.sh && chmod 700 /root/vpswg.sh && bash /root/vpswg.sh
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/natjichang.sh' -o /root/natjichang.sh && chmod 700 /root/natjichang.sh && bash /root/natjichang.sh
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/vpswg.sh' -o /root/vpswg.sh && chmod 700 /root/vpswg.sh && bash /root/vpswg.sh
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/natjichang.sh' -o /root/natjichang.sh && chmod 700 /root/natjichang.sh && bash /root/natjichang.sh
 ```
 
 #### NAT 出口机
@@ -1426,7 +1426,7 @@ curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/natjich
 ```bash
 ( CANDIDATE=$(mktemp) || exit 1
 trap 'rm -f -- "$CANDIDATE"' EXIT
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/nat.sh' -o "$CANDIDATE" && sha256sum /root/nat.sh "$CANDIDATE"
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/nat.sh' -o "$CANDIDATE" && sha256sum /root/nat.sh "$CANDIDATE"
 )
 ```
 
@@ -1444,7 +1444,7 @@ iptables-save > "/root/wg-backups/iptables-${BACKUP_TS}.rules"
 
 **只有明确需要重新初始化或迁移 NAT 端 WG 配置时**，才在维护窗口执行以下命令；它会下载管理脚本并重新初始化 WG，可能造成共用出口所有 Peer 短暂中断：
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
+curl -fsSL 'https://raw.githubusercontent.com/Promise55212/jieshu/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
 ```
 
 </details>

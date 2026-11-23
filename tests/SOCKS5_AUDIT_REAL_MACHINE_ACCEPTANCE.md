@@ -26,9 +26,9 @@ GitHub Actions is an offline regression gate, not a substitute for host-level te
 
 1. Take a full snapshot. Prepare at least two main-version SOCKS5 accounts with distinct ports, credentials, sticky IP policy, and nonzero traffic. Save redacted outputs of socks5 list, quota, ip-show, nft guard, portbw rules, journalctl, and client connectivity.
 2. Confirm legacy .cfg contains no log directive and direct connections work with existing credentials.
-3. Run this branch installer with an explicit source ref:
+3. Run the main-branch installer with an explicit staging source ref:
 
-    S5_SOURCE_REF=feature/socks5-access-audit bash <(curl -fsSL https://raw.githubusercontent.com/liucong552-art/jieshu/feature/socks5-access-audit/socks5-install.sh) update
+    S5_SOURCE_REF=feature/socks5-access-audit bash <(curl -fsSL https://raw.githubusercontent.com/Promise55212/jieshu/main/socks5-install.sh) update
 
 4. Observe planned connection drops while each legacy active service is restarted, then ensure ALL original accounts are active and listening, old credentials still work, IP/ACL/quota/expiry/limits are unchanged apart from legitimate test traffic.
 5. Test authentication with correct/incorrect password; blocked private address and SMTP ports; BIND/UDPASSOC blocked; outbound route remains correct.
@@ -41,9 +41,9 @@ GitHub Actions is an offline regression gate, not a substitute for host-level te
 
 ## Required fresh-machine acceptance (different clean Debian 12 VM / host)
 
-Take a snapshot; then install using the staging branch:
+Take a snapshot; then install using the main-branch installer with staging sources:
 
-    AUTO_DEPS=1 S5_SOURCE_REF=feature/socks5-access-audit bash <(curl -fsSL https://raw.githubusercontent.com/liucong552-art/jieshu/feature/socks5-access-audit/socks5-install.sh) install
+    AUTO_DEPS=1 S5_SOURCE_REF=feature/socks5-access-audit bash <(curl -fsSL https://raw.githubusercontent.com/Promise55212/jieshu/main/socks5-install.sh) install
 
 Create two test nodes:
 

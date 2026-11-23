@@ -30,7 +30,7 @@ if [[ "$ACTION" != deps ]];then
       main|feature/socks5-access-audit) ;;
       *) echo '拒绝未知源码分支，请使用 main 或 feature/socks5-access-audit' >&2; exit 1 ;;
     esac
-    RAW="https://raw.githubusercontent.com/liucong552-art/jieshu/$S5_SOURCE_REF"
+    RAW="https://raw.githubusercontent.com/Promise55212/jieshu/$S5_SOURCE_REF"
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 "$RAW/socks5.py" -o "$FETCH_DIR/socks5.py"
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 "$RAW/socks5-traffic.py" -o "$FETCH_DIR/socks5-traffic.py"
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 "$RAW/socks5-audit.py" -o "$FETCH_DIR/socks5-audit.py"
